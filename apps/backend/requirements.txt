@@ -9,3 +9,6 @@ psycopg2-binary>=2.9.9
 pgvector>=0.2.5
 
 pydantic>=2.7
+
+sentence-transformers
+torch

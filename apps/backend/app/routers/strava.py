@@ -5,8 +5,11 @@ from ..settings import DEFAULT_CLUB_ID
 from sqlalchemy.orm import Session
 from ..db import get_db
 from ..services.strava import client, ingest
+from ..services.strava import embedding_job
+from app.services.strava import summary_job
 
-router = APIRouter()
+# router = APIRouter()
+router = APIRouter(prefix="/strava", tags=["strava"])
 
 @router.get("/me")
 def get_me():
@@ -21,6 +24,20 @@ def get_club_feed(club_id: int, page: int = 1, per_page: int = 50):
 def ingest_club(club_id: int, db: Session = Depends(get_db)):
     """Tarik feed club → simpan ke DB + bikin summary"""
     return ingest.ingest_club_feed(db, club_id)
+
+@router.post("/summaries/generate")
+def generate_summaries(limit: int = 50, db: Session = Depends(get_db)):
+    return summary_job.generate_summaries(db, limit=limit)
+
+@router.post("/embeddings/generate")
+def generate_embeddings(limit: int = 50, db: Session = Depends(get_db)):
+    try:
+        return embedding_job.generate_embeddings(db, limit=limit)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()   # tampil di docker logs
+        return {"error": str(e)}  # tampil di Swagger response
+
 
 # @router.get("/activities/{activity_id}")
 # def get_activity_detail(activity_id: int):

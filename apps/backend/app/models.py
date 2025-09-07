@@ -36,6 +36,6 @@ class ActivitySummary(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     activity_id = Column(Integer, ForeignKey("activities.id"))
     summary = Column(String, nullable=False)
-    embedding = Column(Vector(768))  # nanti buat RAG
+    embedding = Column(Vector(768))  # ubah ke 384, sesuai model
 
     activity = relationship("Activity", back_populates="summary")

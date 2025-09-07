@@ -8,7 +8,7 @@ def ingest_club_feed(db: Session, club_id: int, pages: int = 1, per_page: int = 
     saved = 0
 
     for act in feed:
-        # cek kalau nama udah ada di DB, skip (biar idempotent)
+        # cek kalau sudah ada activity dengan nama & distance yg sama
         exists = db.query(models.Activity).filter_by(
             name=act.get("name"),
             distance_m=act.get("distance"),
@@ -17,13 +17,15 @@ def ingest_club_feed(db: Session, club_id: int, pages: int = 1, per_page: int = 
         if exists:
             continue
 
+        # simpan athlete
         athlete = models.Athlete(
             firstname=act["athlete"].get("firstname"),
             lastname=act["athlete"].get("lastname")
         )
         db.add(athlete)
-        db.flush()  # supaya athlete.id langsung ada
+        db.flush()
 
+        # simpan activity
         activity = models.Activity(
             athlete_id=athlete.id,
             name=act.get("name"),
@@ -36,9 +38,10 @@ def ingest_club_feed(db: Session, club_id: int, pages: int = 1, per_page: int = 
         db.add(activity)
         db.flush()
 
+        # langsung buat summary pakai utils
         summary = models.ActivitySummary(
             activity_id=activity.id,
-            summary=summarize_activity(act)
+            summary=summarize_activity(act)   # <--- di sini kuncinya brok
         )
         db.add(summary)
 
