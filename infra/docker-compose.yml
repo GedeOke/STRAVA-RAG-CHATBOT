@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: strava_pg
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: strava_rag
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+
+  backend:
+    build:
+      context: ./../apps/backend        # relatif dari folder infra
+    container_name: strava_backend
+    env_file:
+      - ./env/.backend.env              # kita buat file ini di langkah 4
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports: ["8000:8000"]
+    depends_on: [postgres]
+
+volumes:
+  postgres_data:
