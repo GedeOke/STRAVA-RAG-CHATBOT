@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, HTTPException
 from typing import Optional
 from ..services.strava import client
 from ..settings import DEFAULT_CLUB_ID
@@ -7,6 +7,8 @@ from ..db import get_db
 from ..services.strava import client, ingest
 from ..services.strava import embedding_job
 from app.services.strava import summary_job
+from app.services.strava import retriever
+
 
 # router = APIRouter()
 router = APIRouter(prefix="/strava", tags=["strava"])
@@ -37,6 +39,15 @@ def generate_embeddings(limit: int = 50, db: Session = Depends(get_db)):
         import traceback
         traceback.print_exc()   # tampil di docker logs
         return {"error": str(e)}  # tampil di Swagger response
+
+@router.get("/search")
+def search(query: str, top_k: int = 5, db: Session = Depends(get_db)):
+    try:
+        print("[ROUTER] /search:", query, top_k)
+        return retriever.search_similar(db, query, top_k)
+    except Exception as e:
+        # kirim pesan jelas ke Swagger (nggak cuma "Internal Server Error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # @router.get("/activities/{activity_id}")
