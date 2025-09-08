@@ -10,5 +10,6 @@ pgvector>=0.2.5
 
 pydantic>=2.7
 
-sentence-transformers
-torch
+sentence-transformers>=5.1.0
+torch>=2.8.0
+groq>=0.31.1

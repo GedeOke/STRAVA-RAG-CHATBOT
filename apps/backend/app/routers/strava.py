@@ -8,6 +8,7 @@ from ..services.strava import client, ingest
 from ..services.strava import embedding_job
 from app.services.strava import summary_job
 from app.services.strava import retriever
+from app.services.strava import answerer
 
 
 # router = APIRouter()
@@ -48,6 +49,15 @@ def search(query: str, top_k: int = 5, db: Session = Depends(get_db)):
     except Exception as e:
         # kirim pesan jelas ke Swagger (nggak cuma "Internal Server Error")
         raise HTTPException(status_code=500, detail=str(e))
+
+from app.services.strava import answerer
+
+@router.get("/qa")
+def qa(query: str, top_k: int = 5, db: Session = Depends(get_db)):
+    """
+    Jawaban berbasis RAG (retriever -> Groq LLM -> jawaban + sumber).
+    """
+    return answerer.answer(db, query, top_k=top_k)
 
 
 # @router.get("/activities/{activity_id}")
