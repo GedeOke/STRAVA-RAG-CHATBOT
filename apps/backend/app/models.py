@@ -12,7 +12,6 @@ class Athlete(Base):
 
     activities = relationship("Activity", back_populates="athlete")
 
-
 class Activity(Base):
     __tablename__ = "activities"
 
@@ -26,16 +25,6 @@ class Activity(Base):
     elev_gain_m = Column(Float)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
+    embedding = Column(Vector(768))  # embedding langsung di sini
+
     athlete = relationship("Athlete", back_populates="activities")
-    summary = relationship("ActivitySummary", back_populates="activity", uselist=False)
-
-
-class ActivitySummary(Base):
-    __tablename__ = "activity_summaries"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    activity_id = Column(Integer, ForeignKey("activities.id"))
-    summary = Column(String, nullable=False)
-    embedding = Column(Vector(768))  # ubah ke 384, sesuai model
-
-    activity = relationship("Activity", back_populates="summary")

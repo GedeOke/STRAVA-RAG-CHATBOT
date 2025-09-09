@@ -162,7 +162,7 @@
                         <div class="flex items-end gap-2">
                             <textarea id="chat-input" rows="1" placeholder="Ketik pertanyaanmu…"
                                 class="flex-1 resize-none rounded-2xl border border-slate-600 bg-slate-800/80 px-4 py-3 text-sm placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500"></textarea>
-                            <button aria-label="Kirim"
+                            <button type="submit" aria-label="Kirim"
                                 class="rounded-2xl bg-gradient-to-r from-cyan-400 to-indigo-500 p-3 text-slate-950">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24"
                                     fill="currentColor">
@@ -221,10 +221,93 @@
         </div>
     </footer>
 
-    <!-- Dummy Chat Logic (unchanged JS) -->
+    <!-- Chat Logic  -->
+    <!-- Chat Logic  -->
     <script>
-        document.getElementById('year').textContent = new Date().getFullYear();
+        // Ubah ini kalau port/host backend beda
+        const API_BASE = window.API_BASE || "http://127.0.0.1:9000/strava";
+
+        const $messages = document.getElementById("messages");
+        const $form = document.getElementById("chat-form");
+        const $input = document.getElementById("chat-input");
+
+        const addMsg = (html, who = "assistant") => {
+            const wrap = document.createElement("div");
+            wrap.className = "message-enter rounded-2xl p-3 text-sm " + (who === "user" ? "bg-slate-700/70" : "bg-slate-800/90");
+            wrap.innerHTML = html;
+            $messages.appendChild(wrap);
+            $messages.scrollTop = $messages.scrollHeight;
+        };
+
+        document.querySelectorAll("[data-suggest]").forEach(btn => {
+            btn.addEventListener("click", () => {
+                $input.value = btn.textContent.trim();
+                $input.focus();
+            });
+        });
+
+        $form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const q = $input.value.trim();
+            if (!q) return;
+
+            addMsg(`<strong>Kamu:</strong> ${escapeHtml(q)}`, "user");
+            $input.value = "";
+
+            const thinking = document.createElement("div");
+            thinking.className = "text-xs text-slate-400 px-1";
+            thinking.textContent = "… mikir dulu ya";
+            $messages.appendChild(thinking);
+
+            try {
+                const url = `${API_BASE}/qa?query=${encodeURIComponent(q)}&top_k=5`;
+                const res = await fetch(url, {
+                    method: "GET",
+                    mode: "cors",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status} — ${res.statusText}`);
+                }
+
+                const data = await res.json();
+                const srcList = (data.sources || []).map(s =>
+                    `<li class="truncate">${escapeHtml(s.summary || "")}</li>`
+                ).join("");
+
+                const html = `
+            <div class="space-y-2">
+            <div><strong>ClubPulse AI:</strong><br>${formatAnswer(data.answer || "")}</div>
+            <details class="text-[11px] opacity-70">
+                <summary>Debug sumber (dev)</summary>
+                <ul class="list-disc pl-4">${srcList}</ul>
+                <div class="mt-1">model: <code>${escapeHtml(data.used_model || "-")}</code></div>
+            </details>
+            </div>
+        `;
+                thinking.remove();
+                addMsg(html, "assistant");
+            } catch (err) {
+                thinking.remove();
+                addMsg(`<span class="text-rose-300">⚠️ Gagal: ${escapeHtml(err.message)}</span>`, "assistant");
+            }
+        });
+
+        function escapeHtml(s) {
+            return (s || "").replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': "&quot;", "'": "&#39;" }[c]));
+        }
+
+        // helper untuk rapihin jawaban (newline + markdown bold)
+        function formatAnswer(s) {
+            return escapeHtml(s)
+                .replace(/\n/g, "<br>")
+                .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+        }
     </script>
+
+
+
 </body>
 
 </html>

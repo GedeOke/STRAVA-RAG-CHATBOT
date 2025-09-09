@@ -7,55 +7,78 @@ import traceback
 
 print("LOADED retriever.py FROM:", __file__)
 
-# Bi-encoder (sama dengan yang dipakai saat generate embeddings)
+# -------- models --------
+# Bi-encoder (sama dgn yang dipakai waktu generate embeddings)
 _bi = SentenceTransformer("all-mpnet-base-v2")
 
-# Cross-encoder untuk re-ranking (lazy-init supaya startup cepat)
+# Cross-encoder untuk re-ranking (lazy init)
 _ce = None
 
-# -------- helpers --------
 
-# pgvector literal HARUS pakai bracket [ ... ]
+# -------- helpers --------
 def _to_pgvector(vec: np.ndarray) -> str:
+    """pgvector literal HARUS pakai bracket [ ... ]"""
     return "[" + ",".join(f"{float(x):.6f}" for x in vec.tolist()) + "]"
 
-# Parse angka jarak dari query: 5km, 5 km, 5k, 5000m, 5K, dst → km (float) atau None
-_DIST_RES = [
+# deteksi angka jarak -> km float
+_RX_KM = [
     re.compile(r'(\d+(?:\.\d+)?)\s*(km|kilometer)\b', re.I),
     re.compile(r'(\d+(?:\.\d+)?)\s*(k)\b', re.I),
     re.compile(r'(\d+(?:\.\d+)?)\s*(m|meter|metre)\b', re.I),
 ]
 def _parse_km(q: str):
-    s = q.strip().replace(" ", "")
-    for rx in _DIST_RES:
+    s = q.strip()
+    for rx in _RX_KM:
         m = rx.search(s)
         if not m:
             continue
         val = float(m.group(1))
-        unit = m.group(2).lower()
+        unit = (m.group(2) or "").lower()
         if unit in ("km", "kilometer"):
             return val
         if unit == "k":
-            return val  # 5k → 5.0 km
+            return val
         if unit in ("m", "meter", "metre"):
             return val / 1000.0
     return None
 
-# Query expansion ringan utk angka jarak
-def _expand_queries(q: str):
-    exps = {q}
-    km = _parse_km(q)
-    if km:
+def _expand_terms(q: str) -> list[str]:
+    """AQE ringan: tambah sinonim + normalisasi angka jarak (ID-first)."""
+    q0 = q.strip()
+    out = [q0]
+
+    # sinonim umum
+    out += ["lari", "running", "run", "jogging"]
+
+    km = _parse_km(q0)
+    if km is not None:
         km_i = int(round(km))
-        exps |= {
-            f"lari {km} km",
+        out += [
+            f"lari {km:.1f} km",
             f"lari {km_i} km",
-            f"lari {km_i}k",
-            f"lari {int(km*1000)} meter",
-        }
+            f"{km_i}k run",
+            f"jogging {km_i} km",
+            f"{int(km*1000)} meter",
+        ]
         if km_i == 5:
-            exps |= {"lari 5k", "lari lima kilometer"}
-    return list({e for e in exps if e})
+            out += ["lari 5k", "lari lima kilometer"]
+
+    # dedup, buang kosong, batasi 6 term biar embed cepat
+    seen, uniq = set(), []
+    for t in out:
+        t = t.strip()
+        if not t: 
+            continue
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq[:6]
+
+def _encode_mean(terms: list[str]) -> np.ndarray:
+    """Encode semua terms -> rata-rata (Aligned Query Expansion)."""
+    vecs = _bi.encode(terms)
+    emb = np.asarray(vecs, dtype=np.float32).mean(axis=0)
+    return emb
 
 def _ensure_ce():
     global _ce
@@ -63,69 +86,76 @@ def _ensure_ce():
         _ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     return _ce
 
-# -------- main search --------
 
+# -------- main search --------
 def search_similar(
     db: Session,
     query: str,
-    top_k: int = 5,
-    tol: float = 0.20,         # toleransi ±20% utk filter jarak
-    candidates: int = 40,      # kandidat awal per ekspansi
-    alpha_km: float = 0.6      # bobot penalti selisih km (untuk hybrid)
+    top_k: int = 50,
+    tol: float = 0.20,       # toleransi ±20% utk filter jarak (kalau query menyebut jarak)
+    candidates: int = 80,    # banyak kandidat awal dari pgvector
+    alpha_km: float = 0.6    # bobot penalti selisih km (semakin besar, makin strict ke jarak)
 ):
     """
-    3 tahap:
-      1) Candidate retrieval (bi-encoder) + structured filter jarak (JOIN activities + BETWEEN)
-      2) Pool dari beberapa query expansion
-      3) Re-rank dengan cross-encoder + penalti selisih km
+    Pipeline:
+    1) Aligned Query Expansion -> average pooling => single query embedding
+    2) Candidate retrieval (pgvector) + optional structured filter jarak
+    3) Re-ranking CrossEncoder + hybrid penalty (emb_dist + alpha*|km_gap|)
     """
+
     try:
+        # (opsional) tuning ivfflat
+        try:
+            db.execute(text("SET ivfflat.probes = 10"))
+        except Exception:
+            pass  # kalau extension/konfigurasi gak ada, lanjut saja
+
+        # --- (1) AQE: perluas query -> rata-rata embedding
+        terms = _expand_terms(query)
+        q_emb = _encode_mean(terms)
+        qvec_lit = _to_pgvector(q_emb)
+
+        # --- (2) Candidate retrieval + filter jarak
         want_km = _parse_km(query)
-        exps = _expand_queries(query)
+        where_dist = ""
+        if want_km is not None:
+            dmin = int(1000 * (want_km * (1 - tol)))
+            dmax = int(1000 * (want_km * (1 + tol)))
+            where_dist = f"AND a.distance_m BETWEEN {dmin} AND {dmax}"
 
-        # pool kandidat dari semua ekspansi
-        pool = {}  # id -> best item
-        for q in exps:
-            # embed query ekspansi
-            q_emb = _bi.encode([q])[0].astype(np.float32)
-            qvec_lit = _to_pgvector(q_emb)
+        # ✅ UPDATE: summary diperjelas (gabung nama atlet + jenis olahraga + nama + jarak)
+        sql = text(f"""
+            SELECT a.id,
+                concat(at.firstname, ' ', at.lastname,
+                        ' melakukan ', a.sport_type,
+                        ' \"', a.name, '\" sejauh ',
+                        round((a.distance_m/1000.0)::numeric, 2), ' km') AS summary,
+                a.distance_m,
+                (a.embedding <-> (:qvec)::vector) AS emb_dist
+            FROM activities a
+            JOIN athletes at ON a.athlete_id = at.id
+            WHERE a.embedding IS NOT NULL
+            {where_dist}
+            ORDER BY a.embedding <-> (:qvec)::vector
+            LIMIT :lim
+        """)
 
-            where_dist = ""
-            if want_km is not None:
-                dmin = int(1000 * (want_km * (1 - tol)))
-                dmax = int(1000 * (want_km * (1 + tol)))
-                where_dist = f"AND a.distance_m BETWEEN {dmin} AND {dmax}"
+        rows = db.execute(sql, {"qvec": qvec_lit, "lim": int(candidates)}).fetchall()
 
-            sql = text(f"""
-                SELECT s.id, s.summary, a.distance_m,
-                       (s.embedding <-> (:qvec)::vector) AS emb_dist
-                FROM activity_summaries s
-                JOIN activities a ON a.id = s.activity_id
-                WHERE s.embedding IS NOT NULL
-                {where_dist}
-                ORDER BY s.embedding <-> (:qvec)::vector
-                LIMIT :lim
-            """)
-            rows = db.execute(sql, {"qvec": qvec_lit, "lim": int(candidates)}).fetchall()
-
-            # masukkan ke pool, simpan yang emb_dist terbaik per id
-            for r in rows:
-                rid = r.id
-                km_val = (r.distance_m or 0) / 1000.0 if r.distance_m is not None else None
-                item = {
-                    "id": rid,
-                    "summary": r.summary,
-                    "km": km_val,
-                    "emb_dist": float(r.emb_dist),
-                }
-                if rid not in pool or item["emb_dist"] < pool[rid]["emb_dist"]:
-                    pool[rid] = item
-
-        items = list(pool.values())
-        if not items:
+        if not rows:
             return []
 
-        # skor hybrid awal: embedding distance + penalti selisih km
+        items = []
+        for r in rows:
+            km_val = (r.distance_m or 0) / 1000.0 if r.distance_m is not None else None
+            items.append({
+                "id": r.id,
+                "summary": r.summary,   # sekarang isi = kalimat deskriptif
+                "km": km_val,
+                "emb_dist": float(r.emb_dist),
+            })
+
+        # hybrid baseline: emb_dist + penalty selisih km
         if want_km is not None:
             for it in items:
                 km_gap = abs((it["km"] or 0) - want_km)
@@ -134,18 +164,17 @@ def search_similar(
             for it in items:
                 it["hybrid"] = it["emb_dist"]
 
-        # Re-rank pakai cross-encoder (kalau modelnya tersedia)
+        # --- (3) Re-rank pakai CrossEncoder (desc), tie-break hybrid
         try:
             ce = _ensure_ce()
             pairs = [(query, it["summary"]) for it in items]
             ce_scores = ce.predict(pairs)  # tinggi = lebih relevan
             for it, sc in zip(items, ce_scores):
                 it["ce_score"] = float(sc)
-            # urutkan: CE desc (terbaik dulu), tie-break hybrid
             items.sort(key=lambda x: (-x["ce_score"], x["hybrid"], x["emb_dist"]))
         except Exception:
-            # fallback kalau CE gagal
             traceback.print_exc()
+            # fallback tanpa CE
             items.sort(key=lambda x: (x["hybrid"], x["emb_dist"]))
 
         return [
