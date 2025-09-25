@@ -260,7 +260,7 @@
             $messages.appendChild(thinking);
 
             try {
-                const url = `${API_BASE}/qa?query=${encodeURIComponent(q)}&top_k=5`;
+                const url = `${API_BASE}/qa?query=${encodeURIComponent(q)}&top_k=50`;
                 const res = await fetch(url, {
                     method: "GET",
                     mode: "cors",

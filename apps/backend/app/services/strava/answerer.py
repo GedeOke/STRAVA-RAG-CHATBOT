@@ -1,60 +1,141 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from sqlalchemy.orm import Session
-import os, re, traceback, logging
+from sqlalchemy import text
+import os, re, logging, calendar
+from datetime import datetime, timedelta
+import dateparser, pytz
 from groq import Groq
 from . import retriever
 
 logger = logging.getLogger(__name__)
 
-# Persona system prompt
+# ===================== Persona =====================
 _SYS_PROMPT = (
-    "Kamu adalah Asisten Strava untuk klub. "
-    "Jawablah dengan gaya santai tapi tetap faktual, 100% hanya dari konteks yang diberikan. "
-    "Gunakan bahasa sehari-hari, boleh bullet list bila membantu. "
-    "Jika tidak yakin, katakan tidak tahu dan tawarkan opsi tindak lanjut. "
-    "Selalu cantumkan referensi [nomor] sesuai sumber yang dipakai."
+    "Kamu adalah Asisten Strava Club yang ngobrol santai, seperti teman satu klub olahraga. "
+    "Jawablah dengan bahasa sehari-hari yang ramah dan enak dibaca, seolah-olah manusia biasa. "
+    "Kalau cocok, boleh pakai bullet list atau paragraf pendek biar jelas. "
+    "Jawab selalu berdasarkan data aktivitas yang aku kasih — jangan bikin cerita sendiri. "
+    "Kalau datanya memang nggak ada, jujur aja bilang belum ada catatan. "
+    "Kalau pertanyaan menyebut angka, tanggal, atau nama, fokuslah pada informasi itu. "
+    "Selipkan referensi [nomor] sesuai sumber data yang dipakai."
 )
+
+# ===================== LLM Client =====================
+_GROQ_CLIENT = None
+
+def get_groq_client() -> Groq:
+    global _GROQ_CLIENT
+    if _GROQ_CLIENT is None:
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY belum diset.")
+        _GROQ_CLIENT = Groq(api_key=api_key, timeout=60)
+    return _GROQ_CLIENT
 
 # ===================== Utils =====================
 
 def _join_contexts(contexts: List[Dict], max_ctx_chars: int = 8000) -> str:
-    """Gabungkan data aktivitas jadi konteks kaya (nama, jarak, dll)."""
+    """Gabungkan context jadi teks natural untuk LLM"""
     parts, used = [], 0
     for i, it in enumerate(contexts, start=1):
-        km_val = f"{it['km']:.2f} km" if it.get("km") is not None else "?"
-        desc = f"[{i}] {it['summary']} • Jarak: {km_val}"
+        km = f"{it.get('km'):.2f} km" if it.get('km') else "?"
+        pace = f"pace {it.get('pace')}/km" if it.get('pace') else ""
+        elev = f"elev {it.get('elev')} m" if it.get('elev') else ""
+        desc = f"[{i}] {it.get('summary','')} • {km} {pace} {elev}".strip()
         chunk = desc[:800]
-        if used + len(chunk) + 1 > max_ctx_chars:
+        if used + len(chunk) > max_ctx_chars:
             break
         parts.append(chunk)
-        used += len(chunk) + 1
+        used += len(chunk)
     return "\n".join(parts)
 
-
 def _parse_citation_indices(text: str) -> List[int]:
-    """Ambil angka di dalam bracket, mis. [1][3] -> [1,3]."""
-    nums = re.findall(r"\[(\d+)\]", text)
-    return sorted(set(int(n) for n in nums if n.isdigit()))
+    return sorted(set(int(n) for n in re.findall(r"\[(\d+)\]", text)))
 
 def _extract_km_from_question(q: str) -> float | None:
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*km\b", q.lower())
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
+    return float(m.group(1).replace(",", ".")) if m else None
 
-def _filter_contexts_by_km(ctx: List[Dict], target_km: float, tol: float = 0.3) -> List[Dict]:
+def _filter_contexts_by_km(ctx: List[Dict], target_km: float, tol: float = 0.3):
     lo, hi = target_km - tol, target_km + tol
-    return [it for it in ctx if (it.get("km") is not None and lo <= float(it["km"]) <= hi)]
+    return [it for it in ctx if (it.get("km") and lo <= float(it["km"]) <= hi)]
 
-def _unique_by_athlete(ctx: List[Dict]) -> List[Dict]:
+def _unique_by_athlete(ctx: List[Dict]):
     seen, out = set(), []
     for it in ctx:
-        s = it.get("summary") or ""
-        name = s.split(" melakukan", 1)[0].strip()
+        name = (it.get("summary") or "").split(" melakukan", 1)[0].strip()
         if name and name not in seen:
             seen.add(name)
             out.append(it)
     return out
+
+# ===================== Date parsing =====================
+
+def parse_date_range(q: str, default_days: int = 7) -> Tuple[datetime, datetime]:
+    tz = pytz.timezone("Asia/Jakarta")
+    now = datetime.now(tz)
+
+    # format eksplisit "8 sampai 13 September 2025"
+    m = re.search(r"(\d{1,2})\s*(?:sampai|sd|-|hingga|to)\s*(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})", q.lower())
+    if m:
+        d1, d2, month, year = m.groups()
+        start = dateparser.parse(f"{d1} {month} {year}", settings={"TIMEZONE": "Asia/Jakarta"})
+        end = dateparser.parse(f"{d2} {month} {year}", settings={"TIMEZONE": "Asia/Jakarta"}) + timedelta(days=1)
+        return start, end
+
+    ql = q.lower()
+    if "hari ini" in ql:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, start + timedelta(days=1)
+    if "kemarin" in ql:
+        y = now - timedelta(days=1)
+        return y.replace(hour=0, minute=0), y.replace(hour=23, minute=59)
+    if "minggu ini" in ql:
+        start = now - timedelta(days=now.weekday())
+        return start, start + timedelta(days=7)
+    if "bulan ini" in ql:
+        start = now.replace(day=1)
+        if start.month == 12:
+            end = start.replace(year=start.year+1, month=1)
+        else:
+            end = start.replace(month=start.month+1)
+        return start, end
+
+    # fallback: default_days terakhir
+    return now - timedelta(days=default_days), now
+
+# ===================== SQL Helpers =====================
+
+def _sql_metric(db: Session, athlete: str, start: datetime, end: datetime, metric: str) -> float | int:
+    if metric == "sum_distance":
+        sql = """
+            SELECT SUM(distance_m)/1000.0
+            FROM activities a
+            JOIN athletes at ON a.athlete_id = at.id
+            WHERE LOWER(at.firstname) = LOWER(:name)
+              AND a.date BETWEEN :start AND :end
+              AND a.distance_m IS NOT NULL
+        """
+    elif metric == "count":
+        sql = """
+            SELECT COUNT(*)
+            FROM activities a
+            JOIN athletes at ON a.athlete_id = at.id
+            WHERE LOWER(at.firstname) = LOWER(:name)
+              AND a.date BETWEEN :start AND :end
+              AND a.distance_m IS NOT NULL
+        """
+    else:
+        return 0
+    row = db.execute(text(sql), {"name": athlete.lower(), "start": start, "end": end}).fetchone()
+    return float(row[0]) if row and row[0] else 0.0
+
+def _extract_names(db: Session, q: str) -> List[str]:
+    ql = q.lower()
+    names = db.execute(text("SELECT DISTINCT LOWER(firstname) FROM athletes")).fetchall()
+    return [n for (n,) in names if n and n in ql]
+
+# ===================== Intent =====================
 
 def _detect_intent(q: str) -> str:
     ql = q.lower()
@@ -63,95 +144,85 @@ def _detect_intent(q: str) -> str:
     if re.search(r"\bbanding(kan)?|compare\b", ql): return "compare"
     if re.search(r"\btren|trend|minggu|bulan\b", ql): return "trend"
     if re.search(r"\btercepat|terlama|top\b", ql): return "top"
+    if "total" in ql and "km" in ql: return "sum_distance"
     return "generic"
 
 # ===================== LLM =====================
 
-def _llm_answer_groq(question: str, contexts: List[Dict]) -> Dict[str, Any]:
-    api_key = (os.getenv("GROQ_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY belum diset.")
+def _llm_answer_groq(question: str, contexts: List[Dict], intent: str):
+    client = get_groq_client()
+    model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
 
-    model = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
-    client = Groq(api_key=api_key, timeout=60)
-
-    ctx_text = _join_contexts(contexts)
-    intent = _detect_intent(question)
-
-    user = (
-        f"Intent: {intent}\n"
-        f"Pertanyaan: {question}\n\n"
-        f"Sumber (ringkasan aktivitas):\n{ctx_text}\n\n"
-        "Instruksi:\n"
-        "- Jawab maksimal 3 kalimat, gaya santai.\n"
-        "- Format sesuai intent (who, count, compare, top, trend, generic).\n"
-        "- Jika pertanyaan menyebut jarak (mis. 5 km), fokus pada aktivitas di jarak itu (±0.3 km).\n"
-        "- Jangan mengarang data di luar sumber.\n"
-        "- Selalu cantumkan referensi [nomor] sesuai sumber."
-    )
+    ctx_text = _join_contexts(contexts) if contexts else ""
+    user = f"Intent: {intent}\nPertanyaan: {question}\nSumber:\n{ctx_text}\n"
 
     resp = client.chat.completions.create(
-        model=model,
-        temperature=float(os.getenv("GROQ_TEMPERATURE", "0.35")),
-        max_tokens=300,
-        top_p=1.0,
-        messages=[
-            {"role": "system", "content": _SYS_PROMPT},
-            {"role": "user", "content": user},
-        ],
+        model=model, temperature=0.35, max_tokens=400, top_p=1.0,
+        messages=[{"role": "system", "content": _SYS_PROMPT}, {"role": "user", "content": user}]
     )
-    text = (resp.choices[0].message.content or "").strip()
+    text = resp.choices[0].message.content.strip()
     cites = _parse_citation_indices(text)
     return {"answer": text, "used_model": model, "cites": cites}
 
-# ===================== Sources projection =====================
+# ===================== Sources =====================
 
-def _project_sources(ctx: List[Dict], cite_indices: List[int]) -> List[Dict]:
-    out = []
-    for i, it in enumerate(ctx, start=1):
-        out.append({
-            "slot": i,
-            "id": it.get("id"),
-            "km": it.get("km"),
-            "emb_dist": it.get("emb_dist"),
-            "ce_score": it.get("ce_score"),
-            "summary": it.get("summary"),
-            "cited": (i in cite_indices),
-        })
-    return out
+def _project_sources(ctx: List[Dict], cite_indices: List[int]):
+    return [{
+        "slot": i, "id": it.get("id"), "km": it.get("km"),
+        "emb_dist": it.get("emb_dist"), "ce_score": it.get("ce_score"),
+        "summary": it.get("summary"), "cited": (i in cite_indices)
+    } for i, it in enumerate(ctx, start=1)]
 
-# ===================== Main entry =====================
+# ===================== Main =====================
 
-def answer(db: Session, question: str, top_k: int = 5, include_sources: bool = True) -> Dict[str, Any]:
-    # 1) Ambil konteks terbaik
+def answer(db: Session, question: str, top_k: int = 50, include_sources: bool = True):
+    intent = _detect_intent(question)
+    start, end = parse_date_range(question)
+
+    # Structured SQL intents
+    if intent in ["sum_distance", "count", "compare"]:
+        names = _extract_names(db, question)
+        if names:
+            if intent == "sum_distance" and len(names) == 1:
+                total = _sql_metric(db, names[0], start, end, "sum_distance")
+                q2 = f"{names[0].title()} total lari {total:.2f} km antara {start.date()} dan {end.date()}. Buat narasi santai."
+                out = _llm_answer_groq(q2, [], "sum_distance")
+                return {"question": question, "answer": out["answer"], "used_model": "sql+llm", "sources": []}
+
+            if intent == "count" and len(names) == 1:
+                cnt = int(_sql_metric(db, names[0], start, end, "count"))
+                q2 = f"{names[0].title()} lari {cnt} kali antara {start.date()} dan {end.date()}. Buat narasi santai."
+                out = _llm_answer_groq(q2, [], "count")
+                return {"question": question, "answer": out["answer"], "used_model": "sql+llm", "sources": []}
+
+            if intent == "compare" or len(names) >= 2:
+                stats = []
+                for n in names:
+                    km = _sql_metric(db, n, start, end, "sum_distance")
+                    cnt = int(_sql_metric(db, n, start, end, "count"))
+                    stats.append(f"{n.title()}: {km:.2f} km dalam {cnt} aktivitas")
+                q2 = question + "\n\nData perbandingan:\n" + "\n".join(stats)
+                out = _llm_answer_groq(q2, [], "compare")
+                return {"question": question, "answer": out["answer"], "used_model": "sql+llm", "sources": []}
+
+    # === Fallback ke RAG ===
     ctx = retriever.search_similar(db, question, top_k=top_k)
+    if not ctx:
+        return {"question": question, "answer": "Aku nggak nemu data.", "used_model": "no-context", "sources": []}
 
-    # 2) Filter by km jika disebut di pertanyaan
     km_q = _extract_km_from_question(question)
-    if km_q is not None:
+    if km_q:
         filtered = _filter_contexts_by_km(ctx, km_q, tol=0.3)
         if filtered:
             ctx = _unique_by_athlete(filtered)
 
-    # 3) Jawab pakai Groq (dengan error handling)
     try:
-        out = _llm_answer_groq(question, ctx)
+        out = _llm_answer_groq(question, ctx, intent)
     except Exception as e:
         logger.error("Groq API error: %s", e, exc_info=True)
-        return {
-            "question": question,
-            "answer": f"Maaf, ada error saat menghubungi LLM: {str(e)}",
-            "used_model": "llm-error",
-            "sources": [],
-        }
+        return {"question": question, "answer": f"Error LLM: {e}", "used_model": "llm-error", "sources": []}
 
-    # 4) Build payload
-    payload: Dict[str, Any] = {
-        "question": question,
-        "answer": out["answer"],
-        "used_model": out["used_model"],
-    }
+    payload = {"question": question, "answer": out["answer"], "used_model": out["used_model"]}
     if include_sources:
         payload["sources"] = _project_sources(ctx, out.get("cites", []))
-
     return payload

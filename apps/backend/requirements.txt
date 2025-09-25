@@ -1,15 +1,23 @@
-fastapi>=0.112
-uvicorn>=0.30
-requests>=2.32
-httpx>=0.27
-python-dotenv>=1.0.1
+fastapi
+uvicorn
+requests
+httpx
+python-dotenv
 
-SQLAlchemy>=2.0
-psycopg2-binary>=2.9.9
-pgvector>=0.2.5
+SQLAlchemy
+psycopg2-binary
+pgvector
 
-pydantic>=2.7
+pydantic
 
-sentence-transformers>=5.1.0
-torch>=2.8.0
-groq>=0.31.1
+# torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+sentence-transformers
+
+groq
+
+dateparser
+pytz
+
+numpy
+scipy
+scikit-learn
