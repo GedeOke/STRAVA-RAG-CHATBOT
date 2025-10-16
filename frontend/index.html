@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="id">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apaan Yaa • Strava RAG Assistant</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #111827;
+            --muted: #94a3b8;
+            --text: #e5e7eb;
+            --accent: #22c55e;
+            --accent2: #38bdf8;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            height: 100%;
+        }
+
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        a {
+            color: var(--accent2);
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .col {
+            flex: 1 1 300px;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid #1f2937;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, .2);
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .title {
+            font-weight: 700;
+            letter-spacing: .2px;
+            font-size: 20px;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .pill {
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            color: var(--muted);
+            margin-bottom: 6px;
+        }
+
+        input[type="text"],
+        input[type="number"],
+        select {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid #1f2937;
+            background: #0b1220;
+            color: var(--text);
+            outline: none;
+        }
+
+        input[type="range"] {
+            width: 100%;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        button {
+            background: #1f2937;
+            color: var(--text);
+            border: 1px solid #334155;
+            padding: 10px 14px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: .15s ease;
+        }
+
+        button.primary {
+            background: var(--accent);
+            border-color: #16a34a;
+            color: #06260f;
+            font-weight: 600;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+        }
+
+        .answer {
+            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+
+        .muted {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .bad {
+            color: #ef4444;
+        }
+
+        .good {
+            color: #10b981;
+        }
+
+        details {
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            border-radius: 10px;
+            padding: 10px 12px;
+        }
+
+        summary {
+            cursor: pointer;
+        }
+
+        .ctx {
+            font-size: 13px;
+            padding: 8px 10px;
+            border-bottom: 1px dashed #1f2937;
+        }
+
+        .ctx:last-child {
+            border-bottom: none;
+        }
+
+        .footer {
+            text-align: center;
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 20px;
+        }
+
+        .tag {
+            display: inline-block;
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            color: var(--muted);
+            padding: 4px 8px;
+            border-radius: 8px;
+            margin-right: 6px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="header">
+                <div>
+                    <div class="title">Apaan Yaa • Running Club Assistant</div>
+                    <div class="subtitle">RAG chatbot untuk tanya‑jawab data Strava Club</div>
+                </div>
+                <div>
+                    <span id="healthBadge" class="pill">Checking API…</span>
+                </div>
+            </div>
+
+            <div class="grid" style="margin-bottom:8px;">
+                <div>
+                    <label>Pertanyaan</label>
+                    <input id="q" type="text" placeholder="Contoh: total km Lussy September" />
+                </div>
+                <div>
+                    <label>Member (opsional)</label>
+                    <input id="member" type="text" placeholder="Nama member (bebas)" />
+                </div>
+                <div>
+                    <label>Bulan (opsional)</label>
+                    <select id="month">
+                        <option value="">—</option>
+                        <option value="1">Januari</option>
+                        <option value="2">Februari</option>
+                        <option value="3">Maret</option>
+                        <option value="4">April</option>
+                        <option value="5">Mei</option>
+                        <option value="6">Juni</option>
+                        <option value="7">Juli</option>
+                        <option value="8">Agustus</option>
+                        <option value="9">September</option>
+                        <option value="10">Oktober</option>
+                        <option value="11">November</option>
+                        <option value="12">Desember</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Tahun (opsional)</label>
+                    <input id="year" type="number" min="2000" max="2100" placeholder="YYYY" />
+                </div>
+                <div>
+                    <label>Top-K konteks: <span id="topkVal">5</span></label>
+                    <input id="topk" type="range" min="1" max="10" value="5" />
+                </div>
+                <div>
+                    <label>Session ID</label>
+                    <input id="session" type="text" placeholder="auto-generated" />
+                </div>
+                <div>
+                    <label>API Base</label>
+                    <input id="api" type="text" placeholder="http://localhost:8000" />
+                <div>
+                </div>
+            </div>
+
+            <div class="controls" style="margin: 6px 0 12px;">
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <input id="withAnswer" type="checkbox" checked /> Jawab dengan LLM
+                </label>
+                <button class="primary" id="askBtn">Tanya</button>
+                <button id="clearBtn">Bersihkan</button>
+                <button id="refreshBtn">Refresh Data (GSheet → Chroma)</button>
+                <span id="status" class="muted"></span>
+            </div>
+
+            <div id="result" class="card" style="background:#0b1220; display:none;">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                    <div>
+                        <div style="font-weight:600;">Jawaban</div>
+                        <div id="meta" class="muted" style="margin-top:2px;"></div>
+                    </div>
+                    <div>
+                        <button id="copyBtn">Copy</button>
+                    </div>
+                </div>
+                <div id="answer" class="answer" style="margin-top:10px;"></div>
+                <details style="margin-top:12px;">
+                    <summary>Contexts</summary>
+                    <div id="contexts" style="margin-top:8px;"></div>
+                </details>
+                <details style="margin-top:10px;">
+                    <summary>Raw JSON</summary>
+                    <pre id="raw" style="white-space:pre-wrap"></pre>
+                </details>
+            </div>
+
+            <div class="footer">Made for Apaan Yaa • <span class="muted">Stay consistent, keep running.</span></div>
+        </div>
+    </div>
+
+    <script>
+        const $ = (s) => document.querySelector(s);
+        const apiBase = (() => {
+            // If served from file:// fallback to localhost
+            try { return window.location.origin.includes('http') ? window.location.origin.replace(/\/$/, '') : 'http://localhost:8000'; } catch { return 'http://localhost:8000'; }
+        })();
+
+        function getApiBase() {
+            try {
+                const v = (document.querySelector('#api')?.value || '').trim() || localStorage.getItem('apaan-yaa-api-base') || apiBase;
+                return v.replace(/\/$/, '');
+            } catch (e) { return apiBase; }
+        }
+
+        function uid() { return 'sess-' + Math.random().toString(36).slice(2, 10); }
+
+        function loadSession() {
+            let sid = localStorage.getItem('apaan-yaa-session-id');
+            if (!sid) { sid = uid(); localStorage.setItem('apaan-yaa-session-id', sid); }
+            $('#session').value = sid;
+        }
+
+        async function health() {
+            try {
+                const r = await fetch(`${getApiBase()}/health/`);
+                const js = await r.json();
+                $('#healthBadge').textContent = js.status === 'ok' ? `API OK • ${js.project}` : 'API issue';
+            } catch (e) {
+                $('#healthBadge').textContent = 'API unreachable';
+            }
+        }
+
+        function setBusy(v) {
+            $('#askBtn').disabled = v; $('#refreshBtn').disabled = v; $('#clearBtn').disabled = v;
+            $('#status').textContent = v ? 'processing…' : '';
+        }
+
+        function renderResult(data) {
+            $('#result').style.display = 'block';
+            $('#meta').textContent = `Provider: ${data.provider || 'none'} • Status: ${data.status}`;
+            $('#answer').textContent = data.answer || '(no answer)';
+            $('#raw').textContent = JSON.stringify(data, null, 2);
+            const ctxWrap = $('#contexts'); ctxWrap.innerHTML = '';
+            (data.contexts || []).forEach((c, i) => {
+                const div = document.createElement('div');
+                div.className = 'ctx';
+                div.textContent = `[${i + 1}] ${c}`;
+                ctxWrap.appendChild(div);
+            });
+        }
+
+        async function ask() {
+            setBusy(true);
+            try {
+                const q = encodeURIComponent($('#q').value.trim());
+                const member = encodeURIComponent($('#member').value.trim());
+                const month = $('#month').value || '';
+                const year = $('#year').value || '';
+                const topk = $('#topk').value;
+                const withAnswer = $('#withAnswer').checked ? 'true' : 'false';
+                const sid = encodeURIComponent($('#session').value.trim());
+
+                const params = new URLSearchParams();
+                params.set('query', $('#q').value.trim());
+                params.set('with_answer', withAnswer);
+                params.set('top_k', topk);
+                if (member) params.set('member', $('#member').value.trim());
+                if (month) params.set('month', month);
+                if (year) params.set('year', year);
+                if (sid) params.set('session_id', $('#session').value.trim());
+
+                const r = await fetch(`${getApiBase()}/strava/ask?${params.toString()}`);
+                const js = await r.json();
+                renderResult(js);
+            } catch (e) {
+                renderResult({ status: 'error', answer: String(e), contexts: [], provider: 'none' });
+            } finally { setBusy(false); }
+        }
+
+        async function refresh() {
+            setBusy(true);
+            try {
+                const r = await fetch(`${getApiBase()}/strava/refresh`, { method: 'POST' });
+                const js = await r.json();
+                $('#status').textContent = `refresh: ${js.status} • updated=${js.updated ?? '-'} skipped=${js.skipped ?? '-'}`;
+            } catch (e) {
+                $('#status').textContent = 'refresh failed';
+            } finally { setBusy(false); }
+        }
+
+        function clearForm() {
+            $('#q').value = '';
+            $('#member').value = '';
+            $('#month').value = '';
+            $('#year').value = '';
+            $('#topk').value = 5; $('#topkVal').textContent = '5';
+            $('#result').style.display = 'none';
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadSession();
+
+            const url = new URL(window.location.href);
+            const apiParam = url.searchParams.get('api');
+            const saved = localStorage.getItem('apaan-yaa-api-base');
+
+            if (document.querySelector('#api')) {
+                const apiInput = document.querySelector('#api');
+                apiInput.value = apiParam || saved || 'http://localhost:8000';
+
+                apiInput.addEventListener('change', () => {
+                    localStorage.setItem('apaan-yaa-api-base', apiInput.value.trim());
+                    health();
+                });
+
+                if (apiParam) {
+                    localStorage.setItem('apaan-yaa-api-base', apiParam);
+                }
+            }
+
+            health();
+
+            $('#topk').addEventListener('input', e => {
+                $('#topkVal').textContent = e.target.value;
+            });
+
+            $('#askBtn').addEventListener('click', ask);
+            $('#refreshBtn').addEventListener('click', refresh);
+            $('#clearBtn').addEventListener('click', clearForm);
+
+            $('#copyBtn').addEventListener('click', () => {
+                const text = $('#answer').textContent || '';
+                navigator.clipboard.writeText(text).then(() => {
+                    $('#status').textContent = 'copied';
+                    setTimeout(() => $('#status').textContent = '', 1200);
+                });
+            });
+        });
+
+    </script>
+</body>
+
+</html>
+
+
+
+
+
