@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 from app.core.logger import logger
 from app.core.utils import timer
 from app.services.rag.retriever import retrieve_context
@@ -34,13 +34,13 @@ def rag_answer(query: str, top_k: int = 5, member: str = None, month: int = None
                 if _id:
                     names.add(str(_id))
             qlow = (query or "").lower()
-            detected: Optional[str] = None
-            for n in names:
-                if n.lower() in qlow:
-                    detected = n
-                    break
-            if detected and (not eff_member or detected.lower() != str(eff_member).lower()):
-                eff_member = detected
+            detected_list: List[str] = [n for n in names if n and n.lower() in qlow]
+            if len(detected_list) >= 2:
+                eff_member = None
+            elif len(detected_list) == 1:
+                detected = detected_list[0]
+                if not eff_member or detected.lower() != str(eff_member).lower():
+                    eff_member = detected
         except Exception:
             pass
 

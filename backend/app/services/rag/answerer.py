@@ -2,9 +2,11 @@ from typing import List, Optional, Tuple, Dict, Any
 from app.core.logger import logger
 from app.core.config import settings
 import re
+from datetime import date
+from app.services.rag.metrics import compute_leaderboard
 
 
-# ===== Deterministic helpers for precise, grounded answers =====
+# ===== Helpers & constants =====
 
 _MONTHS_ID = {
     1: "januari", 2: "februari", 3: "maret", 4: "april",
@@ -14,7 +16,7 @@ _MONTHS_ID = {
 _MONTHS_REV = {v: k for k, v in _MONTHS_ID.items()}
 _MONTHS_REV.update({
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "mei": 5, "jun": 6, "jul": 7,
-    "agu": 8, "sept": 9, "sep": 9, "okt": 10, "nov": 11, "des": 12,
+    "agu": 8, "sep": 9, "sept": 9, "okt": 10, "nov": 11, "des": 12,
 })
 
 
@@ -40,30 +42,15 @@ def _detect_year(query: str) -> Optional[int]:
     return None
 
 
-def _detect_intent(query: str) -> str:
-    """Intent sederhana: 'threshold' | 'total' | 'compare' | 'generic'."""
-    q = (query or "").lower()
-    # threshold (pernah >= N km? 10k?)
-    if re.search(r"\b(pernah|>=|lebih dari|minimal)\b", q) and re.search(r"\b\d+\s*(?:k|km)\b|\b10k\b", q):
-        return "threshold"
-    # total
-    if re.search(r"\b(total|jumlah|akumulasi)\b", q) or re.search(r"\bberapa\s*(?:km|kilometer)\b", q):
-        return "total"
-    # compare
-    if re.search(r"\b(banding|vs|lebih\s+(?:jauh|banyak))\b", q):
-        return "compare"
-    return "generic"
-
-
 def _extract_member_names_from_ctx(ctxs: List[str]) -> Dict[int, str]:
-    names = {}
+    names: Dict[int, str] = {}
     for i, c in enumerate(ctxs, start=1):
         # Format 1 (per-member): "<Nama> melakukan beberapa aktivitas lari: - YYYY-MM-DD: ..."
         m1 = re.match(r"^([^:\n]+?)\s+melakukan\s+beberapa\s+aktivitas\s+lari\s*:\s*", c, flags=re.IGNORECASE)
         if m1:
             names[i] = m1.group(1).strip()
             continue
-        # Format 2 (per-aktivitas): "<Nama>: YYYY-MM-DD: <aktivitas> sejauh X km ..."
+        # Format 2 (fallback, per-aktivitas lama): "<Nama>: YYYY-MM-DD: ..."
         m2 = re.match(r"^([^:\n]+?)\s*:\s*\d{4}-\d{2}-\d{2}\s*:\s*", c)
         if m2:
             names[i] = m2.group(1).strip()
@@ -121,14 +108,13 @@ def _sum_km_from_ctx_text(text: str, month: Optional[int] = None) -> Tuple[float
     total = 0.0
     count = 0
     for line in text.split(" - "):
-        # Cari tanggal di prefix "YYYY-MM-DD:"
         dm = re.search(r"(20\d{2})-(\d{2})-(\d{2})\s*:\s*", line)
         if dm:
             mm = int(dm.group(2))
             if month and mm != month:
                 continue
         elif month is not None:
-            # Jika filter bulan diminta tapi tanggal tidak ditemukan → skip
+            # if month filtering but no date found on the line, skip
             continue
         m = re.search(r"sejauh\s+([0-9]+(?:[.,][0-9]+)?)\s*km", line, flags=re.IGNORECASE)
         if m:
@@ -140,8 +126,7 @@ def _sum_km_from_ctx_text(text: str, month: Optional[int] = None) -> Tuple[float
 
 def _detect_threshold_km(query: str) -> Optional[float]:
     q = (query or "").lower()
-    # examples: "pernah 10 km", "udah 5k?", "pernah lari >= 10?"
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:km|k\b)", q)
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:k|km)\b", q)
     if m:
         try:
             return float(m.group(1).replace(",", "."))
@@ -151,7 +136,6 @@ def _detect_threshold_km(query: str) -> Optional[float]:
 
 
 def _any_run_ge_km(text: str, km: float, month: Optional[int] = None) -> Tuple[bool, Optional[str]]:
-    # returns (found, example_line)
     for line in text.split(" - "):
         dm = re.search(r"(20\d{2})-(\d{2})-(\d{2})\s*:\s*", line)
         if dm:
@@ -168,10 +152,19 @@ def _any_run_ge_km(text: str, km: float, month: Optional[int] = None) -> Tuple[b
     return False, None
 
 
+def _detect_intent(query: str) -> str:
+    """Intent sederhana: 'threshold' | 'total' | 'compare' | 'generic'."""
+    q = (query or "").lower()
+    if re.search(r"\b(pernah|>=|lebih dari|minimal)\b", q) and re.search(r"\b\d+\s*(?:k|km)\b|\b10k\b", q):
+        return "threshold"
+    if re.search(r"\b(total|jumlah|akumulasi)\b", q) or re.search(r"\bberapa\s*(?:km|kilometer)\b", q):
+        return "total"
+    if re.search(r"\b(banding|vs|lebih\s+(?:jauh|banyak)|paling\s+(?:jauh|banyak)|terjauh)\b", q):
+        return "compare"
+    return "generic"
+
+
 def _join_context(ctxs: List[str], max_chars: int = 6000) -> str:
-    """
-    Gabungkan konteks, batasi panjang supaya aman untuk LLM.
-    """
     if not ctxs:
         return ""
     joined, total = [], 0
@@ -185,25 +178,27 @@ def _join_context(ctxs: List[str], max_chars: int = 6000) -> str:
 
 
 def _build_prompts(query: str, ctx: str) -> Tuple[str, str]:
-    """
-    Bangun sepasang (system_prompt, user_prompt) agar gaya lebih terkontrol:
-    - Nada: ramah, playful, tapi tetap faktual dan ringkas.
-    - Batasan: hanya gunakan data pada konteks. Selalu beri referensi [n].
-    - Jika pertanyaan generik (mis. salam), balas hangat + ajukan pertanyaan klarifikasi
-      dan tawarkan opsi terkait data pada konteks (tanpa mengarang fakta baru).
-    """
     system_prompt = (
         "Kamu adalah asisten untuk Apaan Yaa Running Club yang ramah, playful, dan relevan. "
-        "Jawab SINGKAT (1–3 kalimat), dengan bahasa Indonesia santai. "
         "Gunakan HANYA fakta dari 'Konteks'; boleh melakukan penalaran ringan (menjumlahkan, membandingkan) berbasis data. "
-        "Jika data tidak ada di konteks: jelaskan dengan jujur dan tawarkan langkah lanjut/pertanyaan klarifikasi. "
-        "Selalu sertakan rujukan [nomor] pada fakta utama. "
-        "Jika ambigu (beberapa kandidat member/periode), ajukan SATU pertanyaan klarifikasi singkat."
+        "Jika data tidak ada di konteks, jelaskan dengan jujur dan tawarkan pertanyaan klarifikasi singkat. "
+        "Selalu sertakan rujukan [nomor] pada fakta utama."
     )
+    user_prompt = f"Konteks:\n{ctx}\n\nPertanyaan: {query}"
+    return system_prompt, user_prompt
 
+
+def _build_guarded_prompt(query: str, ctx: str, facts: str) -> Tuple[str, str]:
+    system_prompt = (
+        "Kamu adalah asisten Apaan Yaa. Jawab dengan ramah dan faktual. "
+        "Gunakan HANYA data pada KONTEKS dan FAKTA berikut. Jangan mengubah angka pada FAKTA. "
+        "Jika data tidak memadai, katakan terus terang dan tawarkan langkah lanjut yang spesifik. "
+        "Sertakan rujukan [nomor] saat menyebut fakta dari konteks."
+    )
     user_prompt = (
-        f"Konteks:\n{ctx}\n\n"
-        f"Pertanyaan: {query}"
+        f"KONTEKS:\n{ctx}\n\n"
+        f"FAKTA (boleh dirujuk, JANGAN ubah angka):\n{facts}\n\n"
+        f"PERTANYAAN: {query}"
     )
     return system_prompt, user_prompt
 
@@ -211,26 +206,20 @@ def _build_prompts(query: str, ctx: str) -> Tuple[str, str]:
 def _call_openai(prompt: Tuple[str, str], model: str) -> Optional[str]:
     try:
         import os
-        from openai import OpenAI  # openai>=1.x
+        from openai import OpenAI
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.warning("OPENAI_API_KEY tidak ditemukan. Melewati OpenAI.")
             return None
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": prompt[0]},
-                {"role": "user", "content": prompt[1]},
-            ],
+            messages=[{"role": "system", "content": prompt[0]}, {"role": "user", "content": prompt[1]}],
             temperature=0.2,
         )
         return resp.choices[0].message.content.strip()
-    except ImportError:
-        logger.warning("Paket openai belum terpasang. `pip install openai` jika perlu.")
     except Exception as e:
-        logger.exception(f"Error panggil OpenAI: {e}")
-    return None
+        logger.warning(f"OpenAI call failed: {e}")
+        return None
 
 
 def _call_groq(prompt: Tuple[str, str], model: str) -> Optional[str]:
@@ -239,184 +228,150 @@ def _call_groq(prompt: Tuple[str, str], model: str) -> Optional[str]:
         from groq import Groq
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            logger.warning("GROQ_API_KEY tidak ditemukan. Melewati Groq.")
             return None
         client = Groq(api_key=api_key)
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": prompt[0]},
-                {"role": "user", "content": prompt[1]},
-            ],
+            messages=[{"role": "system", "content": prompt[0]}, {"role": "user", "content": prompt[1]}],
             temperature=0.2,
         )
         return resp.choices[0].message.content.strip()
-    except ImportError:
-        logger.warning("Paket groq belum terpasang. `pip install groq` jika perlu.")
     except Exception as e:
-        logger.exception(f"Error panggil Groq: {e}")
-    return None
+        logger.warning(f"Groq call failed: {e}")
+        return None
 
 
 def answer_with_llm(query: str, contexts: List[str]) -> Tuple[str, str]:
     """
-    Menghasilkan jawaban berbasis konteks.
-    Urutan preferensi:
-    1) GROQ (jika GROQ_API_KEY + model tersedia di config)
-    2) OPENAI (jika OPENAI_API_KEY + model tersedia di config)
-    3) Fallback: format jawaban ringkas dari konteks (tanpa LLM)
+    Jawab berbasis konteks. Jika LLM tersedia, biarkan LLM menyusun jawaban natural
+    dengan guardrails: hanya pakai data dari konteks + fakta yang dihitung. Fallback
+    deterministik jika LLM tidak tersedia.
 
     Return: (answer, provider)
     """
-    # Fokus konteks ke member yang disebut jika bisa dideteksi
+    intent = _detect_intent(query)
+
+    # Untuk compare: jangan sempitkan konteks. Selain itu, fokuskan ke member yang disebut.
     narrowed_contexts = contexts
-    try:
-        m = _detect_member_from_query_or_ctx(query, contexts)
+    if intent != "compare":
+        m = None
+        try:
+            m = _detect_member_from_query_or_ctx(query, contexts)
+        except Exception:
+            m = None
         if m:
             name, idx = m
-            narrowed_contexts = [contexts[idx - 1]]
-    except Exception:
-        pass
+            if 1 <= idx <= len(contexts):
+                narrowed_contexts = [contexts[idx - 1]]
 
     ctx_text = _join_context(narrowed_contexts)
     if not ctx_text:
-        return (
-            "Maaf, aku tidak menemukan data relevan di basis data. Coba refresh dulu ya.",
-            "none",
-        )
+        return ("Maaf, aku tidak menemukan data relevan di basis data. Coba refresh dulu ya.", "none")
 
-    # Intent gating: jika pertanyaan bersifat non-numerik/generik, langsung gunakan LLM
-    try:
-        intent_q = (query or "").lower()
-        is_threshold = bool(re.search(r"\b(pernah|>=|lebih dari|minimal)\b", intent_q) and re.search(r"\b\d+\s*(?:k|km)\b|\b10k\b", intent_q))
-        is_total = bool(re.search(r"\b(total|jumlah|akumulasi)\b", intent_q) or re.search(r"\bberapa\s*(?:km|kilometer)\b", intent_q))
-        is_compare = bool(re.search(r"\b(banding|vs|lebih\s+(?:jauh|banyak))\b", intent_q))
-        if not (is_threshold or is_total or is_compare):
-            system_user = _build_prompts(query, ctx_text)
-            # 1) Groq jika ada
-            if getattr(settings, "LLM_PROVIDER", "none").lower() == "groq":
-                model = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
-                out = _call_groq(system_user, model)
-                if out:
-                    return (out, f"groq:{model}")
-            # 2) OpenAI jika ada
-            if getattr(settings, "LLM_PROVIDER", "none").lower() == "openai":
-                model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
-                out = _call_openai(system_user, model)
-                if out:
-                    return (out, f"openai:{model}")
-    except Exception:
-        pass
+    provider = getattr(settings, "LLM_PROVIDER", "none").lower()
 
-    # Jika pertanyaan generik (non‑numerik), langsung pakai LLM biar leluasa namun tetap on‑context
-    intent = _detect_intent(query)
-    if intent == "generic":
-        system_user = _build_prompts(query, ctx_text)
-        if getattr(settings, "LLM_PROVIDER", "none").lower() == "groq":
-            model = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
-            out = _call_groq(system_user, model)
-            if out:
-                return (out, f"groq:{model}")
-        if getattr(settings, "LLM_PROVIDER", "none").lower() == "openai":
-            model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
-            out = _call_openai(system_user, model)
-            if out:
-                return (out, f"openai:{model}")
-        # fallback
-        preview = (narrowed_contexts[0] if narrowed_contexts else "")[:220].replace("\n", " ")
-        answer = (
-            "Aku belum menemukan datanya di konteks. "
-            "Coba sebutkan member/periode yang kamu maksud, atau tanya total/rekap.\n"
-            f"Cuplikan konteks: {preview} ..."
-        )
-        return (answer, "fallback")
+    # ===== Deterministic calculations (as facts) =====
+    month = _detect_month(query)
+    year = _detect_year(query)  # belum dipakai secara khusus pada parsing, tapi tetap dideteksi
 
-    # Binary threshold question handler: "pernah 10 km?"
-    try:
-        target = _detect_member_from_query_or_ctx(query, narrowed_contexts)
-        month = _detect_month(query)
+    facts_lines: List[str] = []
+    if intent in ("total", "compare"):
+        # cari hingga 2 member untuk disajikan sebagai fakta
+        duo = _detect_two_members_from_query(query, contexts) if intent == "compare" else None
+        targets: List[Tuple[str, int]] = []
+        if duo and len(duo) >= 2:
+            targets = [duo[0], duo[1]]
+        else:
+            one = _detect_member_from_query_or_ctx(query, contexts)
+            if one:
+                targets = [one]
+
+        for (member, idx) in targets:
+            text = contexts[idx - 1] if 1 <= idx <= len(contexts) else contexts[0]
+            total_km, n = _sum_km_from_ctx_text(text, month=month)
+            tag = f"bulan {_MONTHS_ID.get(month)}" if month else "semua"
+            facts_lines.append(f"- {member}: total {total_km:.2f} km ({tag}), {n} aktivitas. Rujukan: [{idx}]")
+
+    if intent == "threshold":
+        one = _detect_member_from_query_or_ctx(query, contexts)
         thr = _detect_threshold_km(query)
-        if target and thr is not None:
-            member, idx = target
-            member_ctx = narrowed_contexts[idx - 1] if idx - 1 < len(narrowed_contexts) else narrowed_contexts[0]
-            ok, example = _any_run_ge_km(member_ctx, thr, month=month)
+        if one and thr is not None:
+            member, idx = one
+            text = contexts[idx - 1] if 1 <= idx <= len(contexts) else contexts[0]
+            ok, example = _any_run_ge_km(text, thr, month=month)
+            tag = f" di bulan {_MONTHS_ID.get(month)}" if month else ""
             if ok:
-                mon_txt = f" pada bulan {_MONTHS_ID.get(month)}" if month else ""
-                ex = f" Contoh: {example}" if example else ""
-                return (f"Ya, {member} pernah ≥ {thr:.2f} km{mon_txt}.{ex} Rujukan: [{idx}]", "calc")
+                facts_lines.append(f"- {member} pernah ≥ {thr:.2f} km{tag}. Contoh: {example} (rujukan [{idx}])")
             else:
-                mon_txt = f" pada bulan {_MONTHS_ID.get(month)}" if month else ""
-                return (f"Sejauh konteks yang ada, {member} belum mencapai {thr:.2f} km{mon_txt}. Rujukan: [{idx}]", "calc")
-    except Exception as e:
-        logger.warning(f"Threshold check gagal: {e}")
+                facts_lines.append(f"- {member} belum mencapai {thr:.2f} km{tag} (berdasarkan konteks) (rujukan [{idx}])")
 
-    # Deterministic calculation path for queries like "total berapa km ..." → paling akurat
-    try:
-        target = _detect_member_from_query_or_ctx(query, narrowed_contexts)
-        month = _detect_month(query)
-        year = _detect_year(query)
-        if target:
-            member, idx = target
-            # Pakai konteks index milik member saja supaya ringkas dan akurat
-            member_ctx = narrowed_contexts[idx - 1] if idx - 1 < len(narrowed_contexts) else narrowed_contexts[0]
-            # Year filter: konteks kita mengandung tahun di tanggal, jadi cukup filter via bulan saja di sum;
-            # untuk tahun, jika disebut dan tidak cocok di konteks, hasil bisa nol (itu benar secara data).
-            total_km, n = _sum_km_from_ctx_text(member_ctx, month=month)
-            if n > 0:
-                if month:
-                    mon_name = _MONTHS_ID.get(month, str(month))
-                    period = f"bulan {mon_name}"
-                    if year:
-                        period += f" {year}"
-                    ans = (
-                        f"Total jarak lari {member} pada {period}: {total_km:.2f} km "
-                        f"(dari {n} aktivitas). Rujukan: [{idx}]"
-                    )
-                else:
-                    ans = (
-                        f"Total jarak lari {member} (semua di konteks): {total_km:.2f} km "
-                        f"(dari {n} aktivitas). Rujukan: [{idx}]"
-                    )
-                return (ans, "calc")
+    facts_text = "\n".join(facts_lines) if facts_lines else "(tidak ada fakta hitungan yang relevan)"
 
-        # Comparison: two members mentioned
+    # ===== Use LLM when available =====
+    if provider in ("groq", "openai"):
+        if intent in ("total", "compare", "threshold") and facts_text:
+            prompt = _build_guarded_prompt(query, ctx_text, facts_text)
+            out = _call_groq(prompt, getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")) if provider == "groq" else _call_openai(prompt, getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"))
+            if out:
+                return (out, f"{provider}:{getattr(settings, 'GROQ_MODEL' if provider=='groq' else 'OPENAI_MODEL', '')}")
+        else:
+            prompt = _build_prompts(query, ctx_text)
+            out = _call_groq(prompt, getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")) if provider == "groq" else _call_openai(prompt, getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"))
+            if out:
+                return (out, f"{provider}:{getattr(settings, 'GROQ_MODEL' if provider=='groq' else 'OPENAI_MODEL', '')}")
+
+    # ===== Fallback deterministic answers =====
+    if intent == "threshold":
+        one = _detect_member_from_query_or_ctx(query, contexts)
+        thr = _detect_threshold_km(query)
+        if one and thr is not None:
+            member, idx = one
+            text = contexts[idx - 1] if 1 <= idx <= len(contexts) else contexts[0]
+            ok, example = _any_run_ge_km(text, thr, month=month)
+            if ok:
+                ex = f" Contoh: {example}" if example else ""
+                return (f"Ya, {member} pernah ≥ {thr:.2f} km.{ex} Rujukan: [{idx}]", "calc")
+            else:
+                return (f"Sejauh konteks yang ada, {member} belum mencapai {thr:.2f} km. Rujukan: [{idx}]", "calc")
+
+    if intent == "total":
+        one = _detect_member_from_query_or_ctx(query, contexts)
+        if one:
+            member, idx = one
+            text = contexts[idx - 1] if 1 <= idx <= len(contexts) else contexts[0]
+            total_km, n = _sum_km_from_ctx_text(text, month=month)
+            tag = f"bulan {_MONTHS_ID.get(month)}" if month else "semua di konteks"
+            return (f"Total jarak lari {member} pada {tag}: {total_km:.2f} km (dari {n} aktivitas). Rujukan: [{idx}]", "calc")
+
+    if intent == "compare":
         duo = _detect_two_members_from_query(query, contexts)
         if duo and len(duo) >= 2:
             (m1, i1), (m2, i2) = duo[0], duo[1]
-            t1, n1 = _sum_km_from_ctx_text(contexts[i1 - 1], month=_detect_month(query))
-            t2, n2 = _sum_km_from_ctx_text(contexts[i2 - 1], month=_detect_month(query))
+            t1, n1 = _sum_km_from_ctx_text(contexts[i1 - 1], month=month)
+            t2, n2 = _sum_km_from_ctx_text(contexts[i2 - 1], month=month)
             if n1 + n2 > 0:
                 who = m1 if t1 >= t2 else m2
                 diff = round(abs(t1 - t2), 2)
-                mon = _MONTHS_ID.get(_detect_month(query), None)
-                per = f"bulan {mon}" if mon else "periode yang ada di konteks"
-                ans = (
-                    f"Perbandingan {per}: {m1} {t1:.2f} km (rujukan [{i1}]) vs {m2} {t2:.2f} km (rujukan [{i2}]). "
-                    f"Lebih jauh: {who} (+{diff:.2f} km)."
-                )
-                return (ans, "calc")
-    except Exception as e:
-        logger.warning(f"Deterministic calc gagal, lanjut ke LLM: {e}")
+                per = f"bulan {_MONTHS_ID.get(month)}" if month else "periode yang ada di konteks"
+                return (f"Perbandingan {per}: {m1} {t1:.2f} km (rujukan [{i1}]) vs {m2} {t2:.2f} km (rujukan [{i2}]). Lebih jauh: {who} (+{diff:.2f} km).", "calc")
+        else:
+            # Jika user minta 'leader/siapa paling jauh' tanpa menyebut dua nama, gunakan leaderboard all‑time
+            scope = "all"
+            board = compute_leaderboard(scope=scope)
+            if board:
+                top = board[0]
+                # Cari rujukan indeks untuk top (ambil pertama yang cocok di contexts)
+                ref_idx = None
+                names = _extract_member_names_from_ctx(contexts)
+                for idx, nm in names.items():
+                    if nm.lower() == top["member"].lower():
+                        ref_idx = idx
+                        break
+                ref_txt = f" (rujukan [{ref_idx}])" if ref_idx else ""
+                return (f"Leader (all‑time) berdasarkan total jarak: {top['member']} {top['total_km']:.2f} km dengan {top['activities']} aktivitas{ref_txt}.", "calc")
 
-    system_user = _build_prompts(query, ctx_text)
-
-    # 1) Groq dulu jika dikonfigurasi
-    if getattr(settings, "LLM_PROVIDER", "none").lower() == "groq":
-        model = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
-        out = _call_groq(system_user, model)
-        if out:
-            return (out, f"groq:{model}")
-
-    # 2) OpenAI jika dikonfigurasi
-    if getattr(settings, "LLM_PROVIDER", "none").lower() == "openai":
-        model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
-        out = _call_openai(system_user, model)
-        if out:
-            return (out, f"openai:{model}")
-
-    # 3) Fallback: no external LLM
-    # Ambil highlight dari konteks untuk jawaban singkat
-    preview = (contexts[0] if contexts else "")[:220].replace("\n", " ")
+    # Generic fallback
+    preview = (narrowed_contexts[0] if narrowed_contexts else "")[:220].replace("\n", " ")
     answer = (
         "Halo! Dari konteks yang ada, ini cuplikan singkat:\n"
         f"{preview} ...\n"
