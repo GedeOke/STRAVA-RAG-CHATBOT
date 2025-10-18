@@ -36,7 +36,8 @@ def _normalize_query(q: str) -> str:
 def _collect_member_names() -> Set[str]:
     try:
         collection = get_collection()
-        data = collection.get(where={}, include=["metadatas", "ids"], limit=10000)
+        # ChromaDB: do not include "ids" explicitly; ids are always returned
+        data = collection.get(where={}, include=["metadatas"], limit=10000)
         names: Set[str] = set()
         # from metadatas
         for md in (data.get("metadatas") or []):

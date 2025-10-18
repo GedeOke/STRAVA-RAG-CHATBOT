@@ -63,7 +63,8 @@ def reset_collection():
         except Exception:
             # Jika delete_collection tidak tersedia/bermasalah, fallback delete by ids
             collection = get_collection()
-            got = collection.get(include=["ids"], limit=100000)
+            # ChromaDB: omit include; ids are always returned
+            got = collection.get(limit=100000)
             ids = got.get("ids") or []
             if ids:
                 collection.delete(ids=ids)

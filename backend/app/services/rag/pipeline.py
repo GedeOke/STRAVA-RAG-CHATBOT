@@ -26,7 +26,8 @@ def rag_answer(query: str, top_k: int = 5, member: str = None, month: int = None
             # Collect known member names from collection
             names: Set[str] = set()
             col = get_collection()
-            meta = col.get(where={}, include=["ids", "metadatas"], limit=10000)
+            # ChromaDB: do not include "ids" explicitly; ids are always returned
+            meta = col.get(where={}, include=["metadatas"], limit=10000)
             for md in (meta.get("metadatas") or []):
                 if isinstance(md, dict) and md.get("member_name"):
                     names.add(str(md["member_name"]))

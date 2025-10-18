@@ -140,7 +140,8 @@ def leaderboard(
             iso_year = None
 
         col = get_collection()
-        got = col.get(include=["documents", "ids", "metadatas"], limit=100000)
+        # ChromaDB no longer allows "ids" in include; ids are always returned
+        got = col.get(include=["documents", "metadatas"], limit=100000)
         docs: List[str] = got.get("documents") or []
         ids: List[str] = got.get("ids") or []
         metas: List[dict] = got.get("metadatas") or []

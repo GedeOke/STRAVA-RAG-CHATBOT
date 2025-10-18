@@ -17,7 +17,8 @@ def compute_leaderboard(scope: str = "all", year: Optional[int] = None, month: O
     w = week
 
     col = get_collection()
-    got = col.get(include=["documents", "ids", "metadatas"], limit=100000)
+    # ChromaDB: do not include "ids" explicitly; ids are always returned
+    got = col.get(include=["documents", "metadatas"], limit=100000)
     docs: List[str] = got.get("documents") or []
     ids: List[str] = got.get("ids") or []
     metas: List[dict] = got.get("metadatas") or []
@@ -67,4 +68,3 @@ def compute_leaderboard(scope: str = "all", year: Optional[int] = None, month: O
     for r in board:
         r["total_km"] = round(r["total_km"], 2)
     return board
-
